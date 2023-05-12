@@ -23,6 +23,7 @@ const (
 	rootDevice = "upnp:rootdevice"
 	aliveNTS   = "ssdp:alive"
 	byebyeNTS  = "ssdp:byebye"
+	DefaultMinissdpSocket = "/var/run/minissdpd.sock"
 )
 
 var NetAddr *net.UDPAddr
@@ -90,11 +91,65 @@ type Server struct {
 	NotifyInterval time.Duration
 	closed         chan struct{}
 	Logger         log.Logger
+	MinissdpdSocket string
 }
 
-func makeConn(ifi net.Interface) (ret *net.UDPConn, err error) {
+func makeConn(me *Server) (ret *net.UDPConn, err error) {
+	ifi := me.Interface
 	ret, err = net.ListenMulticastUDP("udp", &ifi, NetAddr)
 	if err != nil {
+		me.Logger.Print(err)
+		me.Logger.Print("trying to use minissdpd as fallback")
+		minissdpd, ssdp_err := net.Dial("unix", me.MinissdpdSocket)
+		if ssdp_err == nil {
+			addrs, addrs_err := me.Interface.Addrs()
+			if addrs_err == nil {
+				for _, addr := range addrs {
+					ip := func() net.IP {
+						switch val := addr.(type) {
+						case *net.IPNet:
+							return val.IP
+						case *net.IPAddr:
+							return val.IP
+						}
+						return nil
+					}()
+					me.Logger.Print("address : ", ip);
+					if ip == nil {
+						continue
+					}
+					if !me.IPFilter(ip) {
+						continue
+					}
+					if ip.IsLinkLocalUnicast() {
+						// These addresses seem to confuse VLC. Possibly there's supposed to be a zone
+						// included in the address, but I don't see one.
+						continue
+					}
+					for _, t := range me.allTypes() {
+						me.Logger.Printf(" type %s (%d bytes)", t, len(t))
+						buf := &bytes.Buffer{}
+						fmt.Fprint(buf, "\x04")
+						// device/service type
+						fmt.Fprintf(buf, "%c%s", len(t), t)
+						// USN
+						usn := me.usnFromTarget(t)
+						fmt.Fprintf(buf, "%c%s", len(usn), usn)
+						// Server string
+						fmt.Fprintf(buf, "%c%s", len(me.Server), me.Server)
+						// Location
+						location := me.Location(ip)
+						fmt.Fprintf(buf, "%c%s", len(location), location)
+						//log.Print(buf)
+						_, write_err := minissdpd.Write(buf.Bytes())
+						if write_err != nil {
+							log.Print(write_err)
+						}
+					}
+				}
+			}
+			minissdpd.Close()
+		}
 		return
 	}
 	p := ipv4.NewPacketConn(ret)
@@ -132,10 +187,14 @@ func (me *Server) serve() {
 
 func (me *Server) Init() (err error) {
 	me.closed = make(chan struct{})
-	me.conn, err = makeConn(me.Interface)
 	if me.IPFilter == nil {
 		me.IPFilter = func(net.IP) bool { return true }
 	}
+	if me.MinissdpdSocket == "" {
+		me.MinissdpdSocket = DefaultMinissdpSocket
+	}
+	me.Logger.Print(me.MinissdpdSocket)
+	me.conn, err = makeConn(me)
 	return
 }
 
